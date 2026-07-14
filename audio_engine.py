@@ -1,65 +1,59 @@
-import os
-import torch
-from scipy.io import wavfile
+"""
+audio_engine.py
+---------------
+This is the "audio cleaning tool" for SENTINEL 2.0.
+
+Job: take a noisy .wav clip (e.g. a scream buried under crowd noise) and pull
+out the clearest / loudest voice from it, so Gemma 4 gets a cleaner signal.
+
+We use SepFormer, a pretrained model from the SpeechBrain library that's
+already trained to separate overlapping speakers. We are NOT training
+anything ourselves — just loading weights and running inference.
+"""
+
+import torchaudio
 from speechbrain.inference.separation import SepformerSeparation as separator
 
-class AudioEngine:
-    def __init__(self):
-        print("[*] Initializing SepFormer Engine... (Downloading model weights if first run)")
-        self.model = separator.from_hparams(
-            source="speechbrain/sepformer-wham", 
-            savedir="pretrained_models/sepformer-wham"
-        )
-        print("[+] SepFormer Engine fully loaded and standing by.")
+print("🔊 Loading SepFormer model... (first run downloads ~150MB, be patient)")
 
-    def isolate_audio(self, input_file_path: str) -> str:
-        """
-        Takes a noisy .wav file path, runs it through the SepFormer neural network,
-        isolates the primary voice track, and saves it cleanly using pure scipy.
-        """
-        if not os.path.exists(input_file_path):
-            return f"Error: Input file '{input_file_path}' not found."
+# This checkpoint is trained on WSJ0-2Mix (2 overlapping speakers).
+# It's the standard starting point for source separation demos.
+model = separator.from_hparams(
+    source="speechbrain/sepformer-wsj02mix",
+    savedir="pretrained_models/sepformer-wsj02mix",
+)
 
-        print(f"[*] Processing file: {input_file_path}")
-        
-        # Create output directory if it doesn't exist
-        output_dir = "processed_audio"
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Set up output file naming
-        base_name = os.path.basename(input_file_path)
-        name_part, _ = os.path.splitext(base_name)
-        final_output_path = os.path.join(output_dir, f"{name_part}_isolated.wav")
 
-        try:
-            # Perform source separation
-            est_sources = self.model.separate_file(path=input_file_path)
-            
-            # Extract the raw audio tensor data (batch=0, time, channel=0)
-            signal = est_sources[0, :, 0].detach().cpu().numpy()
-            
-            # Normalize signal to prevent clipping artifacts
-            import numpy as np
-            if np.max(np.abs(signal)) > 0:
-                signal = signal / np.max(np.abs(signal))
-            
-            # Write out file with pure python scipy at 8000 Hz, bypassing all system codecs
-            wavfile.write(final_output_path, 8000, (signal * 32767).astype(np.int16))
-            
-            print(f"[+] Cleaned audio track saved successfully to: {final_output_path}")
-            return final_output_path
-            
-        except Exception as e:
-            error_msg = f"Error saving isolated audio stream: {str(e)}"
-            print(f"[-] {error_msg}")
-            return error_msg
+def clean_audio(input_wav_path: str, output_wav_path: str) -> str:
+    """
+    input_wav_path  -> path to the noisy .wav file (e.g. from Daksh's script)
+    output_wav_path -> where we save the cleaned .wav file
+
+    Returns the path to the cleaned file, so the caller (FastAPI) can send it back.
+    """
+    # est_sources shape: [batch, time, num_speakers] — SepFormer splits the
+    # audio into separate "guessed speaker" tracks.
+    est_sources = model.separate_file(path=input_wav_path)
+
+    # We don't know in advance which track is the "important" one, so as a
+    # simple heuristic we just pick whichever track has the most energy
+    # (i.e. is loudest overall). Good enough for a hackathon demo.
+    energies = [
+        est_sources[:, :, i].abs().mean().item()
+        for i in range(est_sources.shape[2])
+    ]
+    best_speaker_idx = energies.index(max(energies))
+
+    cleaned = est_sources[:, :, best_speaker_idx].detach().cpu()
+
+    # SepFormer's pretrained models work at 8kHz sample rate
+    torchaudio.save(output_wav_path, cleaned, 8000)
+    return output_wav_path
+
 
 if __name__ == "__main__":
-    engine = AudioEngine()
-    test_file = "sample_noise.wav"
-    
-    if os.path.exists(test_file):
-        result = engine.isolate_audio(test_file)
-        print(f"Test Result Vector: {result}")
-    else:
-        print(f"[-] Test file '{test_file}' not found. Drop a dummy .wav file in this directory to run the test harness.")
+    # Quick manual test before wiring this into FastAPI:
+    # put a file called noisy.wav next to this script, then run:
+    #     python audio_engine.py
+    out = clean_audio("noisy.wav", "cleaned.wav")
+    print(f"✅ Done! Cleaned audio saved to: {out}")

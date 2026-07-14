@@ -8,7 +8,7 @@ model = YOLO("yolov8n.pt")
 
 # Points to Daksh's controller loop now (he'll send you his ngrok link once his
 # server is up — paste it here).
-DAKSH_SERVER_URL = "https://CHANGE_THIS_TO_DAKSHS_NGROK_URL.ngrok-free.app/candidate_event"
+DAKSH_SERVER_URL = "https://garbage-drearily-enactment.ngrok-free.dev"
 
 # Connect to your webcam
 cap = cv2.VideoCapture(0)

@@ -3,21 +3,14 @@ import requests
 import json
 import os
 import logging
-import sqlite3
-import hashlib
-import uuid
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# Attempt to import pynacl for Ed25519 signatures (as per SENTINEL 2.0 spec)
-try:
-    from nacl.signing import SigningKey
-    from nacl.encoding import HexEncoder
-    HAS_NACL = True
-except ImportError:
-    HAS_NACL = False
+# --- IMPORT THE TEAM'S MODULES ---
+import database as db
+import ledger
 
 # Configure structured logging
 logging.basicConfig(
@@ -57,75 +50,6 @@ When you have enough evidence, you MUST call exactly one terminal action:
 Output purely as a JSON object containing either a "tool_call" or an "action".
 """
 
-class SecureLedger:
-    """
-    Step 6: Verdict & Lock
-    Manages the cryptographic chaining (SHA-256) and signing (Ed25519) of incident records in SQLite.
-    """
-    def __init__(self, db_path: str = "sentinel_ledger.db"):
-        self.db_path = db_path
-        self._init_db()
-        self._init_keys()
-
-    def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS ledger (
-                    id TEXT PRIMARY KEY,
-                    timestamp TEXT,
-                    record_json TEXT,
-                    prev_hash TEXT,
-                    hash TEXT,
-                    signature TEXT
-                )
-            """)
-
-    def _init_keys(self):
-        if HAS_NACL:
-            # For demo: generate an ephemeral key if none exists.
-            # In production: load from TPM / secure element.
-            self.signing_key = SigningKey.generate()
-            self.verify_key = self.signing_key.verify_key
-            logger.info("Ed25519 Cryptographic signing enabled (PyNaCl).")
-        else:
-            logger.warning("PyNaCl not installed. Falling back to mock signatures. 'pip install pynacl' for real Ed25519.")
-
-    def _get_last_hash(self) -> str:
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute("SELECT hash FROM ledger ORDER BY timestamp DESC LIMIT 1")
-            row = cursor.fetchone()
-            return row[0] if row else "0000000000000000000000000000000000000000000000000000000000000000"
-
-    def commit_record(self, incident_record: Dict[str, Any]) -> str:
-        record_id = incident_record.get("id", str(uuid.uuid4()))
-        timestamp = datetime.utcnow().isoformat()
-        
-        # Lock schema and serialize
-        record_str = json.dumps(incident_record, sort_keys=True)
-        prev_hash = self._get_last_hash()
-        
-        # SHA-256 Chain
-        hasher = hashlib.sha256()
-        hasher.update(prev_hash.encode('utf-8'))
-        hasher.update(record_str.encode('utf-8'))
-        current_hash = hasher.hexdigest()
-        
-        # Ed25519 Signature
-        signature_hex = "mock_signature_no_pynacl_installed"
-        if HAS_NACL:
-            signed = self.signing_key.sign(current_hash.encode('utf-8'), encoder=HexEncoder)
-            signature_hex = signed.signature.decode('utf-8')
-            
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                "INSERT INTO ledger (id, timestamp, record_json, prev_hash, hash, signature) VALUES (?, ?, ?, ?, ?, ?)",
-                (record_id, timestamp, record_str, prev_hash, current_hash, signature_hex)
-            )
-            
-        logger.info(f"Ledger Commit: Record {record_id[:8]}... cryptographically sealed. Hash: {current_hash[:8]}...")
-        return current_hash
-
-
 class AgenticOrchestrator:
     """
     Step 2 & 3: The Agentic Orchestrator
@@ -133,7 +57,13 @@ class AgenticOrchestrator:
     """
     def __init__(self):
         self.session = self._build_retry_session()
-        self.ledger = SecureLedger()
+        # Initialize the database from the team's script
+        db.init_db()
+        
+        # Generate our agent's keypair for signing records
+        self.priv_key, self.pub_key = ledger.generate_key_pair()
+        self.pub_key_hex = self.pub_key.public_bytes_raw().hex()
+        logger.info(f"Agent Orchestrator initialized. Public Key: {self.pub_key_hex[:16]}...")
 
     def _build_retry_session(self) -> requests.Session:
         session = requests.Session()
@@ -196,6 +126,24 @@ class AgenticOrchestrator:
             logger.error(f"Tool endpoint '{tool_name}' failed: {e}")
             return f"Tool execution network error: {e}"
 
+    def seal_and_store_verdict(self, incident_record: Dict[str, Any]):
+        """Uses the team's database and ledger modules to seal the record."""
+        # Get the previous hash from the team's database module
+        prev_h = db.get_last_hash()
+        
+        event_str = json.dumps(incident_record)
+        t_now = datetime.utcnow().isoformat()
+        
+        # Calculate current hash using the team's ledger module
+        curr_h = ledger.compute_hash(prev_h, event_str, t_now)
+        
+        # Sign the event string
+        sig_hex = ledger.sign_data(self.priv_key, event_str).hex()
+        
+        # Insert into the database
+        db.insert_record(incident_record, prev_h, curr_h, sig_hex, self.pub_key_hex)
+        logger.info(f"Sealed record in ledger. Hash: {curr_h[:12]}...")
+
     def investigate_event(self, candidate_event: Dict[str, Any]):
         """The core multi-turn loop."""
         logger.info("=== New Tier-1 Candidate Event Detected ===")
@@ -222,17 +170,16 @@ class AgenticOrchestrator:
                 
                 # Construct the schema-locked incident record
                 incident_record = {
-                    "id": str(uuid.uuid4()),
-                    "t": datetime.utcnow().isoformat(),
                     "camera": candidate_event.get("camera_id"),
                     "tier1_triggers": candidate_event,
                     "tool_call_trace": tool_call_trace,
                     "action": action,
+                    "severity": llm_response.get("args", {}).get("severity", "LOW" if action == "log_benign" else "HIGH"),
                     "details": llm_response.get("args", {})
                 }
                 
-                # Step 6: Seal the verdict
-                self.ledger.commit_record(incident_record)
+                # Step 6: Seal the verdict using the team's files
+                self.seal_and_store_verdict(incident_record)
                 
                 # Step 7: Operator Live View trigger
                 if action == "raise_alert":

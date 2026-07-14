@@ -1,10 +1,10 @@
 import requests
 from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
-from audio_engine import AudioEngine
+# 1. Import Syna's standalone function directly
+from audio_engine import clean_audio 
 
 app = FastAPI()
-audio_engine = AudioEngine()
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
 class PromptPayload(BaseModel):
@@ -22,10 +22,13 @@ async def analyze_text(payload: PromptPayload):
 
 @app.post("/process-audio")
 async def process_audio(file: UploadFile = File(...)):
-    # Saves incoming audio from Daksh's loop and cleans it
+    # Saves incoming audio from Daksh's loop
     temp_path = f"temp_{file.filename}"
     with open(temp_path, "wb") as buffer:
         buffer.write(await file.read())
     
-    clean_track_path = audio_engine.isolate_audio(temp_path)
+    # 2. Map directly to Syna's function signature (input_path, output_path)
+    clean_track_path = f"processed_{file.filename}"
+    clean_audio(temp_path, clean_track_path)
+    
     return {"status": "success", "cleaned_file": clean_track_path}

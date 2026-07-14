@@ -8,7 +8,7 @@ model = YOLO("yolov8n.pt")
 
 # Points to Daksh's controller loop now (he'll send you his ngrok link once his
 # server is up — paste it here).
-DAKSH_SERVER_URL = "link"
+DAKSH_SERVER_URL = "http://127.0.0.1:8000/candidate_event"
 
 # Connect to your webcam
 cap = cv2.VideoCapture(0)

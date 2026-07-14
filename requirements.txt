@@ -6,3 +6,6 @@ requests
 cryptography
 ultralytics
 opencv-python
+torchaudio
+speechbrain
+

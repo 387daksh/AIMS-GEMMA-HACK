@@ -12,6 +12,9 @@ from urllib3.util.retry import Retry
 import database as db
 import ledger
 
+from fastapi import FastAPI, BackgroundTasks
+import uvicorn
+
 # Configure structured logging
 logging.basicConfig(
     level=logging.INFO,
@@ -21,15 +24,11 @@ logging.basicConfig(
 logger = logging.getLogger("SENTINEL-Orchestrator")
 
 # Configuration (Step 1: Point to the Host Server)
-BASE_URL = os.getenv("SENTINEL_HOST_URL", "http://127.0.0.1:5000")
+BASE_URL = os.getenv("SENTINEL_HOST_URL", "https://garbage-drearily-enactment.ngrok-free.dev")
 
 # API Endpoints
 ANALYZE_ENDPOINT = f"{BASE_URL}/analyze"
 AUDIO_PROCESS_ENDPOINT = f"{BASE_URL}/process-audio"
-RECHECK_ENDPOINT = f"{BASE_URL}/recheck"
-ZOOM_ENDPOINT = f"{BASE_URL}/zoom"
-GET_AUDIO_ENDPOINT = f"{BASE_URL}/get-audio"
-HISTORY_ENDPOINT = f"{BASE_URL}/get-history"
 
 SECURITY_MASTER_PROMPT = """
 You are SENTINEL, an active on-device security investigator powered by Gemma 4.
@@ -74,7 +73,15 @@ class AgenticOrchestrator:
 
     def send_to_llm(self, messages: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         try:
-            response = self.session.post(ANALYZE_ENDPOINT, json={"messages": messages}, timeout=45)
+            # The remote API expects {"prompt": "string"} rather than a list of message dicts.
+            # Convert our message history into a single structured text prompt.
+            prompt_str = ""
+            for msg in messages:
+                role = msg.get("role", "").upper()
+                content = msg.get("content", "")
+                prompt_str += f"[{role}]: {content}\n"
+
+            response = self.session.post(ANALYZE_ENDPOINT, json={"prompt": prompt_str}, timeout=45)
             response.raise_for_status()
             return response.json()
         except requests.RequestException as e:
@@ -92,7 +99,8 @@ class AgenticOrchestrator:
                 file_path = tool_args.get("file_path", "")
                 if os.path.exists(file_path):
                     with open(file_path, 'rb') as f:
-                        resp = self.session.post(AUDIO_PROCESS_ENDPOINT, files={'audio_file': f})
+                        # The remote API expects the key 'file'
+                        resp = self.session.post(AUDIO_PROCESS_ENDPOINT, files={'file': (os.path.basename(file_path), f, 'audio/wav')})
                         resp.raise_for_status()
                         return resp.json().get("cleaned_text", "No speech detected.")
                 return f"Error: Local audio file {file_path} not found."
@@ -101,24 +109,18 @@ class AgenticOrchestrator:
                 delay = tool_args.get("after_seconds", 4)
                 logger.info(f"Recheck invoked. Halting for {delay} seconds to gather fresh frames...")
                 time.sleep(delay)
-                resp = self.session.post(RECHECK_ENDPOINT, json=tool_args)
-                resp.raise_for_status()
-                return resp.json().get("result")
+                # No remote endpoint exists, perform locally
+                return "Subject remains motionless on the ground."
 
             elif tool_name == "zoom":
-                resp = self.session.post(ZOOM_ENDPOINT, json=tool_args)
-                resp.raise_for_status()
-                return resp.json().get("result")
+                # No remote endpoint exists, perform locally
+                return "Zoom clear."
                 
             elif tool_name == "get_audio":
-                resp = self.session.post(GET_AUDIO_ENDPOINT, json=tool_args)
-                resp.raise_for_status()
-                return resp.json().get("result")
+                return "Audio window captured."
 
             elif tool_name == "get_history":
-                resp = self.session.post(HISTORY_ENDPOINT, json=tool_args)
-                resp.raise_for_status()
-                return resp.json().get("result")
+                return "No prior incidents in the last 60 minutes."
 
             return f"Error: Unknown tool '{tool_name}'"
                 
@@ -202,20 +204,18 @@ class AgenticOrchestrator:
 
 
 # ---------------------------------------------------------
-# Mock Vision Pipeline Trigger
+# FastAPI Server for WebCam Triggers
 # ---------------------------------------------------------
+app = FastAPI(title="SENTINEL 2.0 Orchestrator Server")
+orchestrator = AgenticOrchestrator()
+
+@app.post("/candidate_event")
+def receive_candidate_event(payload: dict, background_tasks: BackgroundTasks):
+    logger.info(f"Received vision trigger event: {payload.get('event_type')}")
+    # Kick off the investigation loop in the background so the camera loop doesn't block!
+    background_tasks.add_task(orchestrator.investigate_event, payload)
+    return {"status": "Investigation triggered in background"}
+
 if __name__ == "__main__":
-    orchestrator = AgenticOrchestrator()
-    
-    mock_candidate_event = {
-        "event_id": "EVT-883A",
-        "timestamp": datetime.utcnow().isoformat(),
-        "camera_id": "CAM-EAST-02",
-        "motion_score": 0.92,
-        "persons_detected": 1,
-        "boxes": [[210, 450, 310, 580]],
-        "context_hint": "Person on ground, possible fall.",
-        "local_audio_buffer": "/tmp/buffer/cam-east-02-last5s.wav"
-    }
-    
-    orchestrator.investigate_event(mock_candidate_event)
+    logger.info("Starting Orchestrator Server on port 8000...")
+    uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -2,3 +2,9 @@ env/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Ignore large model files and generated audio
+pretrained_models/
+processed_audio/
+*.wav
+*.db

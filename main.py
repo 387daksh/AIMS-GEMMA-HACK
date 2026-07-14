@@ -1,8 +1,11 @@
 import requests
 from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel
-# 1. Import Syna's standalone function directly
-from audio_engine import clean_audio 
+# 1. Import Syna's newly refactored AudioEngine class
+from audio_engine import AudioEngine
+
+# Initialize the SpeechBrain engine on startup so it doesn't reload on every request
+engine = AudioEngine()
 
 app = FastAPI()
 OLLAMA_URL = "http://localhost:11434/api/generate"
@@ -27,8 +30,7 @@ async def process_audio(file: UploadFile = File(...)):
     with open(temp_path, "wb") as buffer:
         buffer.write(await file.read())
     
-    # 2. Map directly to Syna's function signature (input_path, output_path)
-    clean_track_path = f"processed_{file.filename}"
-    clean_audio(temp_path, clean_track_path)
+    # 2. Map directly to Syna's new class method
+    clean_track_path = engine.isolate_audio(temp_path)
     
     return {"status": "success", "cleaned_file": clean_track_path}

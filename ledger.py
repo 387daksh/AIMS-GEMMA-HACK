@@ -58,5 +58,35 @@ def verify_chain(records) -> tuple[bool, str]:
             return False, f"Chain broken at Record #{rec_id}: Fraudulent signature detected!"
             
         expected_prev_hash = current_hash
-        
+
     return True, "All cryptosignatures valid. Ledger integrity fully verified."
+
+
+def verify_chain_detailed(records) -> tuple[bool, "int | None", str]:
+    """
+    Same walk as verify_chain, but also returns which record id broke the
+    chain (or None if valid) so callers like the dashboard API don't have
+    to regex the message string. Added alongside verify_chain rather than
+    changing its return shape, since app.py already unpacks it as a 2-tuple.
+    """
+    if not records:
+        return True, None, "Ledger is empty. System healthy."
+
+    expected_prev_hash = "0" * 64
+
+    for record in records:
+        rec_id, timestamp, event_data, prev_hash, current_hash, signature, pub_key, _ = record
+
+        if prev_hash != expected_prev_hash:
+            return False, rec_id, f"Chain broken at Record #{rec_id}: Previous hash mismatch!"
+
+        calculated_hash = compute_hash(prev_hash, event_data, timestamp)
+        if current_hash != calculated_hash:
+            return False, rec_id, f"Chain broken at Record #{rec_id}: Hash integrity compromised!"
+
+        if not verify_signature(pub_key, signature, event_data):
+            return False, rec_id, f"Chain broken at Record #{rec_id}: Fraudulent signature detected!"
+
+        expected_prev_hash = current_hash
+
+    return True, None, "All cryptosignatures valid. Ledger integrity fully verified."

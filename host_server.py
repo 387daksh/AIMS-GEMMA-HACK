@@ -1,92 +1,92 @@
-import os
-import shutil
-from fastapi import FastAPI, File, UploadFile
+import json
+import logging
+
+from fastapi import FastAPI, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse
 import uvicorn
 
-# Import the team's newly pulled audio engine!
-import audio_engine
+import database as db
+import ledger
+from orchestrator import AgenticOrchestrator
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("SENTINEL-HostServer")
 
 app = FastAPI(title="SENTINEL 2.0 Host Server")
 
-# A simple state tracker to mock a multi-turn investigation by Gemma 4
-# Once you have Gemma 4 running locally, you replace this function with a real LLM call.
-call_count = 0
+db.init_db()
+orchestrator = AgenticOrchestrator()
 
-@app.post("/analyze")
-def analyze(payload: dict):
-    global call_count
-    call_count += 1
-    
-    # Turn 1: Gemma asks to clean the noisy audio
-    if call_count == 1:
-        return {
-            "tool_call": "process_audio",
-            "tool_args": {"file_path": "dummy_audio.wav"}
-        }
-    
-    # Turn 2: Gemma asks for fresh frames after a short delay
-    if call_count == 2:
-        return {
-            "tool_call": "recheck",
-            "tool_args": {"after_seconds": 2}
-        }
-    
-    # Turn 3: Gemma makes a final decision and raises an alert
-    call_count = 0  # reset for next run
-    return {
-        "action": "raise_alert",
-        "args": {
-            "severity": "CRITICAL",
-            "justification": "Person fell to the ground. Cleaned audio reveals a distress scream. No recovery in follow-up frames.",
-            "evidence_ids": ["audio_transcript_1", "recheck_frames_4"]
-        }
-    }
 
-@app.post("/process-audio")
-async def process_audio(audio_file: UploadFile = File(...)):
-    """
-    Receives noisy audio from Daksh's Orchestrator, saves it, and runs
-    the team's SpeechBrain (SepFormer) audio_engine to clean it.
-    """
-    input_path = f"temp_in_{audio_file.filename}"
-    output_path = f"temp_out_cleaned_{audio_file.filename}"
-    
-    # 1. Save the incoming payload to disk
-    with open(input_path, "wb") as buffer:
-        shutil.copyfileobj(audio_file.file, buffer)
-        
-    print(f"🔊 Processing audio with SepFormer: {input_path}")
-    
-    # 2. Run the team's actual SpeechBrain SepFormer separation!
-    cleaned_file_path = audio_engine.clean_audio(input_path, output_path)
-    print(f"✅ Audio cleaned and saved to {cleaned_file_path}")
-    
-    # 3. In a 100% complete pipeline, this cleaned wav would go to Whisper or Gemma-Audio.
-    # We simulate the text output for the demo:
-    simulated_transcript = "[DISTRESS DETECTED] Help me!"
-    
-    # Clean up the noisy temp file
-    if os.path.exists(input_path):
-        os.remove(input_path)
-    
-    return {
-        "cleaned_text": simulated_transcript, 
-        "cleaned_file_path": cleaned_file_path
-    }
+@app.get("/")
+def dashboard():
+    return FileResponse("templates/index.html")
 
-@app.post("/recheck")
-def recheck(payload: dict):
-    # Mocking fresh frame check
-    return {"result": "Subject remains motionless on the ground."}
 
-@app.post("/zoom")
-def zoom(payload: dict):
-    return {"result": "Zoom clear."}
+@app.post("/candidate-event")
+def receive_candidate_event(payload: dict, background_tasks: BackgroundTasks):
+    camera = payload.get("camera_id")
 
-@app.post("/get-history")
-def get_history(payload: dict):
-    return {"result": "No prior incidents in the last 60 minutes."}
+    # Single-flight: must acquire the lock synchronously, before scheduling the
+    # background task — background_tasks only run after this response is sent,
+    # so this is the only point where we can honestly tell the caller "busy".
+    if not orchestrator.try_begin_episode(payload):
+        logger.warning(f"Rejecting candidate event from {camera}: an investigation is already in progress.")
+        return JSONResponse(status_code=409, content={
+            "status": "busy",
+            "detail": "An investigation is already in progress. This candidate event was dropped.",
+        })
+
+    logger.info(f"Received Tier-1 candidate event: {payload.get('event_type')} from {camera}")
+    # Runs the agentic investigation in the background so vision_trigger's POST returns immediately.
+    background_tasks.add_task(orchestrator.run_investigation, payload)
+    return {"status": "investigation_triggered"}
+
+
+@app.get("/api/ledger-logs")
+def ledger_logs():
+    records = db.get_all_records(include_suppressed=True)
+    out = []
+    for record in records:
+        rec_id, timestamp, event_data_str, prev_hash, current_hash, signature, pub_key, is_suppressed = record
+        try:
+            event = json.loads(event_data_str)
+        except (json.JSONDecodeError, TypeError):
+            event = {}
+        out.append({
+            "id": rec_id,
+            "timestamp": timestamp,
+            "camera": event.get("camera", "unknown"),
+            "severity": event.get("severity", "LOW"),
+            "action": event.get("action", ""),
+            "justification": event.get("justification", ""),
+            "tool_call_trace": event.get("tool_call_trace", []),
+            "tier1_triggers": event.get("tier1_triggers", {}),
+            "previous_hash": prev_hash,
+            "current_hash": current_hash,
+            "is_suppressed": bool(is_suppressed),
+        })
+    out.reverse()  # newest first
+    return JSONResponse(out)
+
+
+@app.get("/api/verify")
+def verify_ledger():
+    records = db.get_all_records(include_suppressed=True)
+    valid, broken_at, message = ledger.verify_chain_detailed(records)
+    return {"valid": valid, "broken_at": broken_at, "message": message}
+
+
+@app.get("/api/status")
+def status():
+    """Powers the dashboard's 'investigating...' indicator."""
+    return orchestrator.get_status()
+
 
 if __name__ == "__main__":
-    print("🚀 Starting Syna's Host Server on port 5000...")
-    uvicorn.run(app, host="127.0.0.1", port=5000)
+    logger.info("Starting SENTINEL Host Server on port 8000...")
+    uvicorn.run(app, host="0.0.0.0", port=8000)

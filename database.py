@@ -1,6 +1,5 @@
 import sqlite3
 import json
-from datetime import datetime
 
 # This is the name of the file where our database spreadsheet will live on your Mac
 DB_NAME = "ledger.db"
@@ -32,17 +31,19 @@ def init_db():
     conn.commit()
     conn.close()
 
-def insert_record(event_data_dict, prev_hash, curr_hash, signature_hex, pub_key_hex):
+def insert_record(event_data_dict, prev_hash, curr_hash, signature_hex, pub_key_hex, timestamp):
     """
     Step 1B: Insert a Record.
     This function lets Daksh's agent loop push new logs into our database easily.
+
+    timestamp must be the exact same value the caller used to compute curr_hash
+    (via ledger.compute_hash). Generating a fresh timestamp here instead of
+    accepting the caller's would desync the stored row from the hash that was
+    actually signed, making every record fail verification.
     """
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    
-    # Automatically capture the exact time this log hits our system in UTC format
-    timestamp = datetime.utcnow().isoformat()
-    
+
     # json.dumps converts a Python dictionary {} into a clean text string so the DB can store it
     cursor.execute("""
         INSERT INTO incident_record (timestamp, event_data, previous_hash, current_hash, signature, public_key)
@@ -80,6 +81,44 @@ def toggle_suppression(record_id, suppress_status):
     cursor.execute("UPDATE incident_record SET is_suppressed = ? WHERE id = ?", (1 if suppress_status else 0, record_id))
     conn.commit()
     conn.close()
+
+def get_recent_records_for_camera(camera_id, since_iso, include_suppressed=True):
+    """
+    Step 1E: Camera History.
+    Filters the full ledger down to records for one camera within a time
+    window, for the orchestrator's get_history tool. Reuses get_all_records
+    rather than raw SQL JSON extraction, since event_data is stored as a
+    JSON string and we want this portable across SQLite builds.
+    """
+    records = get_all_records(include_suppressed=include_suppressed)
+    matches = []
+
+    for record in records:
+        rec_id, timestamp, event_data_str, _, _, _, _, is_suppressed = record
+
+        if timestamp < since_iso:
+            continue
+
+        try:
+            event = json.loads(event_data_str)
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        record_camera = event.get("camera") or event.get("tier1_triggers", {}).get("camera_id")
+        if record_camera != camera_id:
+            continue
+
+        matches.append({
+            "id": rec_id,
+            "timestamp": timestamp,
+            "severity": event.get("severity", "UNKNOWN"),
+            "justification": event.get("justification", ""),
+            "action": event.get("action", ""),
+            "is_suppressed": bool(is_suppressed),
+        })
+
+    return matches
+
 
 # This part only runs if YOU execute this file directly to test it!
 def get_last_hash():

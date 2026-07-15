@@ -1,6 +1,6 @@
-# SENTINEL 2.0: Agentic AI Security System
+# DrishTI: Agentic AI Security System
 
-SENTINEL is a multi-agent AI security pipeline powered by Gemma. It utilizes a vision trigger (YOLOv8) to detect anomalies (like falls) and orchestrates a local LLM to reason about the event, call tools (Zoom, Recheck, Audio Isolation + Transcription), and securely log terminal decisions to a cryptographic SQLite ledger.
+DrishTI is a multi-agent AI security pipeline powered by Gemma. It utilizes a vision trigger (YOLOv8) to detect anomalies (like falls) and orchestrates a local LLM to reason about the event, call tools (Zoom, Recheck, Audio Isolation + Transcription), and securely log terminal decisions to a cryptographic SQLite ledger.
 
 ## Requirements for Mac
 - **Python 3.10+**
@@ -27,7 +27,7 @@ pip install fastapi uvicorn requests opencv-python ultralytics speechbrain faste
 ```
 
 ### 3. Run the Microservices
-SENTINEL is composed of 3 distinct services. Open **3 separate terminal tabs**, ensure your virtual environment is activated in all of them (`source env/bin/activate`), and run them in this order:
+DrishTI is composed of 3 distinct services. Open **3 separate terminal tabs**, ensure your virtual environment is activated in all of them (`source env/bin/activate`), and run them in this order:
 
 **Terminal 1: Audio Service (Speech-to-Text & Noise Isolation)**
 ```bash

@@ -32,16 +32,16 @@ ORCHESTRATOR_URL = os.getenv("SENTINEL_ORCHESTRATOR_URL", "http://127.0.0.1:8000
 TOOL_SERVER_PORT = int(os.getenv("SENTINEL_VISION_TOOL_PORT", "5001"))
 CAMERA_ID = os.getenv("SENTINEL_CAMERA_ID", "Cam-MacBook-Air")
 
-COOLDOWN = float(os.getenv("SENTINEL_EVENT_COOLDOWN", "8"))  # min seconds between candidate-events per camera
+COOLDOWN = float(os.getenv("SENTINEL_EVENT_COOLDOWN", "120"))  # min seconds between candidate-events per camera (increased for demo stability)
 MOTION_THRESHOLD = float(os.getenv("SENTINEL_MOTION_THRESHOLD", "0.18"))  # below this, treat as trivial jitter
 FRAME_BUFFER_MAXLEN = 200  # ~7-13s of raw full-res frames depending on fps; keeps memory bounded
 
-# Load an ultra-lightweight object detector (downloads automatically on first run)
-model = YOLO("yolov8n.pt")
+# Load an ultra-lightweight pose estimator to get the "fake dots" skeleton
+model = YOLO("yolov8n-pose.pt")
 
 # --- SHARED STATE (written by the capture loop, read by the tool server thread) ---
 buffer_lock = threading.Lock()
-frame_buffer = deque(maxlen=FRAME_BUFFER_MAXLEN)  # entries: (ts, raw_bgr_frame, boxes, confidences, motion_score)
+frame_buffer = deque(maxlen=FRAME_BUFFER_MAXLEN)  # entries: (ts, annotated_frame, boxes, confidences, motion_score)
 trace_buffer = deque(maxlen=1000)  # lightweight historical trace: (ts, boxes, motion_score)
 audio_state = {"samples": None, "sample_rate": None, "session_start": None}
 
@@ -347,19 +347,26 @@ def main():
 
         # --- YOLO DETECTION (throttled to every 3rd frame to save CPU) ---
         if (frame_counter % process_every) == 0:
-            results = model(frame, verbose=False)[0]
-            persons = []
-            boxes = []
-            for box in results.boxes:
-                class_id = int(box.cls[0])
-                if class_id == 0:  # COCO index 0 is 'person'
-                    confidence = float(box.conf[0])
-                    x1, y1, x2, y2 = box.xyxy[0].tolist()
-                    persons.append(confidence)
-                    boxes.append([x1, y1, x2, y2])
-            last_persons = persons
-            last_boxes = boxes
-            last_annotated = results.plot()
+            res = model.predict(frame, verbose=False, classes=[0])[0]
+            annotated_frame = res.plot()
+
+            current_boxes = []
+            confidences = []
+            person_detected = False
+            top_confidence = 0.0
+
+            if len(res.boxes) > 0:
+                person_detected = True
+                for box in res.boxes:
+                    conf = float(box.conf[0])
+                    current_boxes.append(box.xyxy[0].tolist())
+                    confidences.append(conf)
+                    if conf > top_confidence:
+                        top_confidence = conf
+
+            last_persons = confidences
+            last_boxes = current_boxes
+            last_annotated = annotated_frame
         else:
             persons = last_persons
             boxes = last_boxes
@@ -392,7 +399,9 @@ def main():
             latest_frames["privacy"] = blurred_frame
 
         with buffer_lock:
-            frame_buffer.append((now, frame.copy(), boxes, persons, round(motion_score, 3)))
+            # Store the ANNOTATED frame (which has the "fake dots" skeleton) 
+            # so the Agent and dashboard sees it when zooming/rechecking!
+            frame_buffer.append((now, last_annotated.copy(), boxes, persons, round(motion_score, 3)))
             trace_buffer.append((now, boxes, round(motion_score, 3)))
 
         person_detected = len(persons) > 0

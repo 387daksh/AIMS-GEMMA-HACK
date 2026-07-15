@@ -9,12 +9,14 @@ Built entirely around **Gemma**, it features a **Three-Tier Architecture**:
 
 ---
 
-## 🖥️ Mission Control Dashboard
+## 🖥️ Mission Control Dashboard & Wow Factors
 Sentinel comes with a fully customized **Glassmorphism Mission Control Dashboard**.
-- **Live Feeds**: View 3 zero-latency MJPEG feeds simultaneously (Raw, YOLO, Privacy pixelation mask).
-- **Live Streaming Logs**: The dashboard uses a 500ms polling endpoint to stream Gemma's thoughts, tool calls, and decisions in exactly real-time without blocking on the database!
-- **Auto-Extracted Audio**: When a fall is detected, ambient audio is extracted in milliseconds and injected into both the UI and the Twilio SMS.
-- **Two-Way Audio Alerts**: The UI tracks when Gemma activates the physical speakers to talk to subjects.
+- **Live "Fake Dots" Skeletal Tracking**: The vision pipeline uses `yolov8n-pose.pt` to actively map the human body geometry during a fall. These skeletal maps are piped directly into the UI dashboard when Gemma uses the `zoom` or `recheck` tools!
+- **Hacker Typewriter UI**: Watch Gemma's thoughts and tool-calls physically type out on the screen in real time as she actively investigates the scene.
+- **Auto-Speak "Voice of God"**: The instant a fall is detected, the machine physically speaks out loud using `pyttsx3` ("Warning. Fall detected. Sentinel AI is analyzing the scene.") without blocking the LLM reasoning pipeline.
+- **Live CCTV Scanline Feeds**: View 3 zero-latency MJPEG feeds simultaneously (Raw, YOLO Pose, Privacy pixelation mask) overlaid with an authentic CRT scanline effect.
+- **Manual Override Button**: A dedicated UI button to instantly bypass the AI and trigger a Twilio SMS escalation.
+- **Hard Demo Lockout**: Prevents the UI from clearing during a presentation once a Critical Alert is reached.
 
 ---
 
@@ -54,37 +56,24 @@ pip install -r requirements.txt
 
 ## 🚀 Running the End-to-End Story
 
-To run the complete demo for the judges, you need to launch the architecture's three microservices in **three separate terminals**. 
+To run the complete demo for the judges, you no longer need to open three terminals! We built a master launch script.
 
-Make sure your virtual environment is activated in all three!
+Make sure your virtual environment is activated, then simply run:
 
-### Terminal 1: The Host Server & Dashboard
-This starts the backend API and serves the frontend dashboard.
 ```bash
-python host_server.py
+python run_sentinel.py
 ```
-*(Runs on `http://127.0.0.1:8000`)*
 
-### Terminal 2: The Gemma Agent & Audio Engine
-This starts the heavy lifting STT/Audio separation engine and the main LLM entry point.
-```bash
-python main.py
-```
-*(Runs on `http://127.0.0.1:5000`)*
-
-### Terminal 3: The Vision Trigger
-This starts the video processing loop, MJPEG streams, and candidate event trigger.
-Make sure you use the compiled video that has the audio stitched in!
-```bash
-python vision_trigger.py --source "Fall2_Cam4_with_audio.mp4"
-```
-*(Runs on `http://127.0.0.1:5001`)*
+This single command will spin up all three microservices simultaneously:
+1. **The Host Server** (`http://127.0.0.1:8000`)
+2. **The Gemma Agent** (`http://127.0.0.1:5000`)
+3. **The Vision Trigger** (`http://127.0.0.1:5001`)
 
 ### 🎮 The Grand Finale
-Once all three terminals are running, open your browser to:
+Once the script prints `✅ ALL SYSTEMS ONLINE!`, open your browser to:
 **[http://127.0.0.1:8000/](http://127.0.0.1:8000/)**
 
-You'll see the Mission Control UI. Turn your speakers up! When the patient falls, you'll hear Gemma use the Two-Way audio (`pyttsx3`) to ask if they need help, analyze their response using Whisper, and automatically escalate the situation. 
+You'll see the Mission Control UI. Turn your speakers up! When the patient falls, the laptop will announce the detection out loud, the CCTV feeds will show the skeletal tracking, and you'll watch Gemma actively type out her investigation in the terminal before dispatching the Twilio SMS alert. 
 
 ---
 

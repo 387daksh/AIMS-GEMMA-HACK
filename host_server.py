@@ -42,6 +42,16 @@ def receive_candidate_event(payload: dict, background_tasks: BackgroundTasks):
             "detail": "An investigation is already in progress. This candidate event was dropped.",
         })
 
+    # HARD DEMO LOCKOUT: If we already have logs and we reached an alert, ignore new events for 2 minutes
+    # so the screen doesn't clear during the presentation!
+    if hasattr(orchestrator, 'live_logs') and any(log.get('type') == 'alert' for log in orchestrator.live_logs):
+        import time
+        if not hasattr(orchestrator, 'last_alert_time'):
+            orchestrator.last_alert_time = time.time()
+        if time.time() - orchestrator.last_alert_time < 120:
+            orchestrator._episode_lock.release()
+            return JSONResponse(status_code=429, content={"status": "locked", "detail": "Demo lockout active."})
+
     logger.info(f"Received Tier-1 candidate event: {payload.get('event_type')} from {camera}")
     # Runs the agentic investigation in the background so vision_trigger's POST returns immediately.
     background_tasks.add_task(orchestrator.run_investigation, payload)

@@ -1,6 +1,20 @@
 import os
 import torch
 from scipy.io import wavfile
+# --- MONKEY PATCH SPEECHBRAIN LAZY MODULE INSPECT BUG ---
+# SpeechBrain's LazyModule crashes inspect.getmodule on Windows during torchaudio load
+try:
+    import speechbrain.utils.importutils
+    _orig_getattr = speechbrain.utils.importutils.LazyModule.__getattr__
+    def _safe_getattr(self, attr):
+        if attr == "__file__" and not self.loaded:
+            raise AttributeError("LazyModule has no __file__ yet")
+        return _orig_getattr(self, attr)
+    speechbrain.utils.importutils.LazyModule.__getattr__ = _safe_getattr
+except Exception:
+    pass
+# --------------------------------------------------------
+
 from speechbrain.inference.separation import SepformerSeparation as separator
 try:
     from faster_whisper import WhisperModel
@@ -8,7 +22,7 @@ except ImportError:
     WhisperModel = None
 
 # Windows Hackathon Fix: SpeechBrain tries to create symlinks which require Admin on Windows.
-# We monkeypatch pathlib to copy the files instead!
+# We monkeypatch pathlib to copy the files instead! (Windows-only hack)
 import pathlib
 import shutil
 def _safe_symlink(self, target, target_is_directory=False):
@@ -68,22 +82,42 @@ class AudioEngine:
             # Perform source separation
             est_sources = self.model.separate_file(path=input_file_path)
             
-            # Extract the raw audio tensor data (batch=0, time, channel=0)
-            signal = est_sources[0, :, 0].detach().cpu().numpy()
+            # Extract both channels
+            signal_0 = est_sources[0, :, 0].detach().cpu().numpy()
+            signal_1 = est_sources[0, :, 1].detach().cpu().numpy()
             
-            # Normalize signal to prevent clipping artifacts
+            # Save both to temporary files
+            temp_0 = "processed_audio/channel_0_temp.wav"
+            temp_1 = "processed_audio/channel_1_temp.wav"
             import numpy as np
-            if np.max(np.abs(signal)) > 0:
-                signal = signal / np.max(np.abs(signal))
+            wavfile.write(temp_0, 8000, (signal_0 * 32767).astype(np.int16))
+            wavfile.write(temp_1, 8000, (signal_1 * 32767).astype(np.int16))
             
-            # Write out file with pure python scipy at 8000 Hz, bypassing all system codecs
-            wavfile.write(final_output_path, 8000, (signal * 32767).astype(np.int16))
+            # Score each channel by transcribing
+            text_0 = self.transcribe_audio(temp_0)
+            text_1 = self.transcribe_audio(temp_1)
             
-            print(f"[+] Cleaned audio track saved successfully to: {final_output_path}")
-            return final_output_path
+            # Pick the channel with the longest text (most words), or fallback to channel 0
+            if len(text_1) > len(text_0):
+                best_signal = signal_1
+                transcript = text_1
+            else:
+                best_signal = signal_0
+                transcript = text_0
+                
+            os.remove(temp_0)
+            os.remove(temp_1)
+
+            # Save the best clean signal
+            out_name = f"isolated_{base_name}"
+            out_path = os.path.join("processed_audio", out_name)
+            wavfile.write(out_path, 8000, (best_signal * 32767).astype(np.int16))
             
+            print(f"[+] Cleaned audio track saved successfully to: {out_path}")
+            return out_path, transcript
         except Exception as e:
-            error_msg = f"Error saving isolated audio stream: {str(e)}"
+            import traceback
+            error_msg = f"Error saving isolated audio stream: {str(e)}\n{traceback.format_exc()}"
             print(f"[-] {error_msg}")
             return error_msg
 

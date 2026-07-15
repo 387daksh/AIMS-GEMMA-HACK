@@ -140,6 +140,16 @@ def get_recent_records_for_camera(camera_id, since_iso, include_suppressed=True)
 
     return matches
 
+def clear_ledger():
+    """
+    Step 1F: Clear the Ledger.
+    Wipes the database for clean demo runs.
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM incident_record")
+    conn.commit()
+    conn.close()
 
 # This part only runs if YOU execute this file directly to test it!
 def get_last_hash():

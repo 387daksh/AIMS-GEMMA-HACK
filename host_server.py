@@ -19,6 +19,7 @@ logger = logging.getLogger("SENTINEL-HostServer")
 app = FastAPI(title="SENTINEL 2.0 Host Server")
 
 db.init_db()
+db.clear_ledger()
 orchestrator = AgenticOrchestrator()
 
 
@@ -52,7 +53,7 @@ def ledger_logs():
     records = db.get_all_records(include_suppressed=True)
     out = []
     for record in records:
-        rec_id, timestamp, event_data_str, prev_hash, current_hash, signature, pub_key, is_suppressed = record
+        rec_id, timestamp, event_data_str, prev_hash, current_hash, signature, pub_key, is_suppressed = record[:8]
         try:
             event = json.loads(event_data_str)
         except (json.JSONDecodeError, TypeError):
@@ -81,6 +82,10 @@ def verify_ledger():
     return {"valid": valid, "broken_at": broken_at, "message": message}
 
 
+@app.get("/api/live-logs")
+def get_live_logs():
+    return JSONResponse(orchestrator.live_logs)
+
 @app.get("/api/status")
 def status():
     """Powers the dashboard's 'investigating...' indicator."""
@@ -89,4 +94,4 @@ def status():
 
 if __name__ == "__main__":
     logger.info("Starting SENTINEL Host Server on port 8000...")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000)

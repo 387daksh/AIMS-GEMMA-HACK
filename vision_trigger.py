@@ -5,14 +5,27 @@ import threading
 import time
 from collections import deque
 from typing import Optional
+from datetime import datetime, timedelta
 
 import cv2
 import numpy as np
 import requests
 from ultralytics import YOLO
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
 from scipy.io import wavfile
 import uvicorn
+
+# Initialize cascade globally
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+# Global state for MJPEG streaming
+stream_lock = threading.Lock()
+latest_frames = {
+    "original": None,
+    "yolo": None,
+    "privacy": None
+}
 
 # --- CONFIG (all localhost, all overridable via env for the demo) ---
 ORCHESTRATOR_URL = os.getenv("SENTINEL_ORCHESTRATOR_URL", "http://127.0.0.1:8000/candidate-event")
@@ -59,12 +72,23 @@ def load_audio_track(path: str):
     stays empty in that mode and get_audio degrades gracefully.
     """
     try:
-        import torchaudio
-        waveform, sr = torchaudio.load(path)
-        mono = waveform.mean(dim=0).numpy().astype(np.float32)
-        audio_state["samples"] = mono
-        audio_state["sample_rate"] = sr
-        print(f"[+] Loaded audio track from {path}: {mono.shape[0] / sr:.1f}s @ {sr}Hz")
+        import av
+        container = av.open(path)
+        audio_stream = next(s for s in container.streams if s.type == 'audio')
+        
+        samples = []
+        for frame in container.decode(audio_stream):
+            samples.append(frame.to_ndarray())
+            
+        audio_data = np.concatenate(samples, axis=1)
+        if audio_data.shape[0] > 1:
+            audio_data = np.mean(audio_data, axis=0)
+        else:
+            audio_data = audio_data[0]
+            
+        audio_state["samples"] = audio_data.astype(np.float32)
+        audio_state["sample_rate"] = audio_stream.sample_rate
+        print(f"[+] Loaded audio track from {path}: {audio_data.shape[0] / audio_stream.sample_rate:.1f}s @ {audio_stream.sample_rate}Hz")
     except Exception as e:
         print(f"[-] No usable audio track in '{path}' ({e}). get_audio will report unavailable.")
 
@@ -77,9 +101,23 @@ def load_audio_track(path: str):
 # ---------------------------------------------------------------------------
 tool_app = FastAPI(title="SENTINEL Vision Tool Server")
 
+tool_app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 def _encode_jpg(frame) -> str:
-    ok, buf = cv2.imencode(".jpg", frame)
+    h, w = frame.shape[:2]
+    max_dim = 640
+    if max(h, w) > max_dim:
+        scale = max_dim / max(h, w)
+        frame = cv2.resize(frame, (int(w * scale), int(h * scale)))
+        
+    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 30])
     if not ok:
         raise HTTPException(500, "Failed to encode frame as JPEG")
     return base64.b64encode(buf.tobytes()).decode("ascii")
@@ -99,6 +137,23 @@ def health():
     with buffer_lock:
         buffered = len(frame_buffer)
     return {"status": "ok", "camera_id": CAMERA_ID, "buffered_frames": buffered}
+
+
+@tool_app.get("/video_feed/{mode}")
+def video_feed(mode: str):
+    """MJPEG stream endpoint: /video_feed/original, /video_feed/yolo, or /video_feed/privacy"""
+    from fastapi.responses import StreamingResponse
+    def generate():
+        while True:
+            with stream_lock:
+                frame = latest_frames.get(mode)
+            if frame is None:
+                time.sleep(0.1)
+                continue
+            _, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
+    return StreamingResponse(generate(), media_type="multipart/x-mixed-replace; boundary=frame")
 
 
 @tool_app.get("/recheck")
@@ -188,9 +243,19 @@ def get_audio_clip(t_start: float, t_end: float):
     rms = float(np.sqrt(np.mean(clip ** 2))) if clip.size else 0.0
 
     os.makedirs("audio_clips", exist_ok=True)
+    
+    # Cleanup files older than 5 minutes (300 seconds)
+    now = time.time()
+    for f in os.listdir("audio_clips"):
+        f_path = os.path.join("audio_clips", f)
+        if os.path.isfile(f_path) and now - os.path.getmtime(f_path) > 300:
+            try:
+                os.remove(f_path)
+            except OSError:
+                pass
+
     clip_path = os.path.join("audio_clips", f"clip_{int(t_start * 1000)}_{int(t_end * 1000)}.wav")
     wavfile.write(clip_path, sr, np.clip(clip * 32767, -32768, 32767).astype(np.int16))
-
     return {
         "camera_id": CAMERA_ID,
         "clip_path": os.path.abspath(clip_path),
@@ -228,12 +293,13 @@ def main():
     # For a staged file, pace reads to roughly real-time so recheck's wall-clock
     # wait actually corresponds to new footage, same as it would from a live camera.
     source_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    frame_interval = (1.0 / source_fps) / 4.0 if is_file and source_fps > 0 else 0.0
+    frame_interval = (1.0 / source_fps) if is_file and source_fps > 0 else 0.0
 
     last_sent_by_camera = {}
     prev_gray_frame = None
     loop_count = 0
     frame_counter = 0
+    process_every = 3
     
     # Store the last YOLO output to reuse during skipped frames
     last_persons = []
@@ -245,6 +311,12 @@ def main():
     while cap.isOpened():
         frame_counter += 1
         loop_start = time.time()
+        
+        # Fast-forward 3 frames for 4x speed
+        if is_file:
+            for _ in range(3):
+                cap.grab()
+                
         ret, frame = cap.read()
         if not ret:
             if is_file:
@@ -274,7 +346,7 @@ def main():
         prev_gray_frame = gray
 
         # --- YOLO DETECTION (throttled to every 3rd frame to save CPU) ---
-        if frame_counter % 3 == 0 or not last_boxes:
+        if (frame_counter % process_every) == 0:
             results = model(frame, verbose=False)[0]
             persons = []
             boxes = []
@@ -282,16 +354,42 @@ def main():
                 class_id = int(box.cls[0])
                 if class_id == 0:  # COCO index 0 is 'person'
                     confidence = float(box.conf[0])
-                    xyxy = box.xyxy[0].tolist()
+                    x1, y1, x2, y2 = box.xyxy[0].tolist()
                     persons.append(confidence)
-                    boxes.append(xyxy)
+                    boxes.append([x1, y1, x2, y2])
             last_persons = persons
             last_boxes = boxes
-            if not args.headless:
-                last_annotated = results.plot()
+            last_annotated = results.plot()
         else:
             persons = last_persons
             boxes = last_boxes
+            if last_annotated is None:
+                last_annotated = frame.copy()
+
+        # Generate Privacy Blur frame
+        blurred_frame = frame.copy()
+        gray_for_face = cv2.cvtColor(blurred_frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray_for_face, 1.1, 4)
+        for (x, y, w, h) in faces:
+            # Add margin
+            x1, y1 = max(0, x-15), max(0, y-15)
+            x2, y2 = min(blurred_frame.shape[1], x+w+15), min(blurred_frame.shape[0], y+h+15)
+            roi = blurred_frame[y1:y2, x1:x2]
+            
+            h_roi, w_roi = roi.shape[:2]
+            if h_roi > 0 and w_roi > 0:
+                # Pixelate effect (CCTV style)
+                pixel_size = max(8, min(w_roi, h_roi) // 6)
+                temp = cv2.resize(roi, (max(1, w_roi // pixel_size), max(1, h_roi // pixel_size)), interpolation=cv2.INTER_LINEAR)
+                roi = cv2.resize(temp, (w_roi, h_roi), interpolation=cv2.INTER_NEAREST)
+                
+            blurred_frame[y1:y2, x1:x2] = roi
+
+        # Update MJPEG stream buffers
+        with stream_lock:
+            latest_frames["original"] = frame.copy()
+            latest_frames["yolo"] = last_annotated
+            latest_frames["privacy"] = blurred_frame
 
         with buffer_lock:
             frame_buffer.append((now, frame.copy(), boxes, persons, round(motion_score, 3)))

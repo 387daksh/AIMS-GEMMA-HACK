@@ -47,6 +47,9 @@ You have exactly these tools:
 - get_audio(t_start, t_end): Pull a window from the rolling raw audio buffer.
   Returns acoustic features (peak/RMS amplitude, duration, clip_path) — NOT a
   transcript. Use this first before deciding whether isolation is needed.
+- speak_to_camera(message): Use the on-device speaker to ask the subject a question 
+  (e.g., "Do you need help?"). You MUST use this tool to attempt a wellness check 
+  before raising an alert on an ambiguous fall.
 - isolate_audio(clip_path): Run SepFormer source separation on a clip_path you
   already obtained from get_audio. This tool will now automatically run Speech-to-Text
   on the isolated audio and return a text transcript of what was spoken! Only call this 
@@ -58,7 +61,7 @@ You have exactly these tools:
 Before terminating, prefer to gather at least one piece of confirming evidence
 (e.g. zoom to verify what you're actually seeing, recheck to confirm motion
 persists) unless the candidate event is already unambiguous either way.
-Terminating on the very first turn with zero tool calls should be rare.
+CRITICAL SPEED REQUIREMENT: You MUST terminate the investigation and call raise_alert or log_benign after a MAXIMUM of 1 tool call. Do not chain multiple tools. Make a decision instantly based on the first tool result!
 
 WELFARE CONCERNS ARE ALERTS TOO — not just threats. A large share of real
 emergencies involve no second person, no weapon, and no aggression at all. Do
@@ -153,6 +156,9 @@ class AgenticOrchestrator:
         # interleave with a normal one mid get_last_hash()/insert_record(),
         # which would fork the hash chain.
         self._ledger_lock = threading.Lock()
+        
+        # Live streaming logs for the UI
+        self.live_logs = []
 
         threading.Thread(target=self._watchdog_loop, daemon=True).start()
         logger.info(f"Episode watchdog armed (timeout={MAX_EPISODE_SECONDS:.0f}s, poll={WATCHDOG_POLL_SECONDS}s).")
@@ -241,11 +247,12 @@ class AgenticOrchestrator:
             self._finalize(
                 candidate_event or {},
                 tool_call_trace=[],
-                action="log_benign",
+                action="raise_alert",
                 args={
-                    "reason": f"Investigation forcibly terminated by the watchdog after running "
+                    "severity": "CRITICAL",
+                    "justification": f"Investigation forcibly terminated by the watchdog after running "
                               f"{elapsed:.1f}s, exceeding the {MAX_EPISODE_SECONDS:.0f}s safety timeout. "
-                              f"This usually means Ollama or a tool endpoint stopped responding.",
+                              f"This usually means Ollama or a tool endpoint stopped responding. Assuming worst-case scenario.",
                     "evidence_ids": [],
                 },
                 turn_timings=[{"kind": "watchdog_timeout", "think": None, "elapsed_seconds": round(elapsed, 2)}],
@@ -284,8 +291,9 @@ class AgenticOrchestrator:
         raise_alert/log_benign decision, since that reasoning trace is what gets
         shown in the demo.
         """
-        start = time.monotonic()
+        start = time.time()
         logger.info(f"Ollama call started (think={think})")
+        self.live_logs.append({"type": "info", "msg": f"Reasoning Engine active (deep_think={think})..."})
         try:
             response = self.session.post(
                 OLLAMA_URL,
@@ -294,7 +302,8 @@ class AgenticOrchestrator:
                     "messages": messages, 
                     "stream": False, 
                     "format": "json",
-                    "keep_alive": "10m"
+                    "keep_alive": "10m",
+                    "options": {"num_ctx": 32768}
                 },
                 timeout=180 if think else 60,
             )
@@ -315,6 +324,7 @@ class AgenticOrchestrator:
 
     def execute_tool(self, tool_name: str, tool_args: Dict[str, Any], candidate_event: Dict[str, Any]) -> Any:
         logger.info(f"Executing '{tool_name}' with args: {tool_args}")
+        self.live_logs.append({"type": "tool", "tool": tool_name, "args": tool_args})
         tool_server = candidate_event.get("tool_server_url", DEFAULT_VISION_TOOL_URL)
         try:
             if tool_name == "recheck":
@@ -395,6 +405,17 @@ class AgenticOrchestrator:
                 records = db.get_recent_records_for_camera(camera_id, since_iso)
                 return {"camera_id": camera_id, "window_minutes": minutes, "records": records}
 
+            elif tool_name == "speak_to_camera":
+                import pyttsx3
+                message = tool_args.get("message", "Do you need help?")
+                try:
+                    engine = pyttsx3.init()
+                    engine.say(message)
+                    engine.runAndWait()
+                    return {"status": "success", "message_spoken": message}
+                except Exception as e:
+                    return {"status": "error", "error": str(e)}
+
             return {"error": f"Unknown tool '{tool_name}'"}
 
         except requests.RequestException as e:
@@ -421,6 +442,39 @@ class AgenticOrchestrator:
             with open("anchor.log", "a") as f:
                 f.write(f"{t_now} | {self.pub_key_hex} | {curr_h}\n")
         logger.info(f"Sealed record in ledger. Hash: {curr_h[:12]}...")
+
+    def _send_twilio_alert(self, message_body: str):
+        self.live_logs.append({"type": "info", "msg": "Dispatching SMS to Emergency Contacts..."})
+        logger.info("=====================================================")
+        logger.info(f"[SMS DISPATCH] Dispatching alert: {message_body}")
+        logger.info("=====================================================")
+        
+        account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+        auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+        from_number = os.getenv("TWILIO_FROM_NUMBER")
+        to_number = os.getenv("TWILIO_TO_NUMBER")
+
+        if not all([account_sid, auth_token, from_number, to_number]):
+            logger.warning("Twilio credentials not fully configured (missing SID, Token, or numbers). SMS functionally bypassed.")
+            return
+
+        url = f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json"
+        auth = (account_sid, auth_token)
+        data = {
+            "To": to_number,
+            "From": from_number,
+            "Body": message_body
+        }
+
+        try:
+            response = self.session.post(url, auth=auth, data=data, timeout=10)
+            response.raise_for_status()
+            self.live_logs.append({"type": "info", "msg": "SMS Status: DELIVERED"})
+        except Exception as e:
+            self.live_logs.append({"type": "alert", "msg": f"SMS Status: FAILED ({e})"})
+            logger.error(f"Failed to send real Twilio SMS alert: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                logger.error(f"Twilio error details: {e.response.text}")
 
     def _finalize(self, candidate_event: Dict[str, Any], tool_call_trace: List[Dict[str, Any]],
                   action: str, args: Dict[str, Any], turn_timings: List[Dict[str, Any]],
@@ -475,22 +529,72 @@ class AgenticOrchestrator:
         logger.info(f"Episode complete in {total_elapsed:.2f}s across {len(turn_timings)} LLM turn(s): {breakdown}")
 
         if action == "raise_alert":
+            self.live_logs.append({"type": "header", "msg": "--- ESCALATION PROTOCOL ---"})
+            self.live_logs.append({"type": "alert", "msg": f"Verdict: CRITICAL ALERT"})
+            self.live_logs.append({"type": "alert", "msg": f"Reason: {justification}"})
             logger.warning(f"ALERT RAISED: {justification}")
+            
+            # Append transcript to SMS if we auto-extracted it
+            sms_body = f"SENTINEL Alert [{severity}]: {justification}"
+            transcript = candidate_event.get("auto_transcript")
+            if transcript and transcript != "[No speech]":
+                sms_body += f"\n[AUDIO EXTRACTED]: \"{transcript}\""
+                
+            self._send_twilio_alert(sms_body)
         else:
+            self.live_logs.append({"type": "info", "msg": f"Verdict: BENIGN"})
+            self.live_logs.append({"type": "info", "msg": f"Reason: {justification}"})
             logger.info(f"EVENT LOGGED BENIGN: {justification}")
+
+    def _is_unambiguous_emergency(self, candidate_event: Dict[str, Any]) -> bool:
+        posture = candidate_event.get("posture")
+        duration = candidate_event.get("posture_duration_seconds", 0)
+        motion = candidate_event.get("motion_score", 0)
+        return posture == "prone" and duration >= 5 and motion < 0.05
 
     def investigate_event(self, candidate_event: Dict[str, Any]):
         """
         The core multi-turn loop. Always ends in exactly one raise_alert or log_benign.
-
-        Every turn is first asked with think=False (fast, for tool selection). If
-        that draft response is itself a terminal action, we don't know that until
-        after the call — so we re-ask the SAME turn with think=True to get the
-        deep-reasoned version that actually becomes the signed justification. The
-        shallow draft is discarded, not logged into the conversation history.
         """
+        self.live_logs = [{"type": "header", "msg": "--- TIER-1 ANOMALY DETECTED ---"}]
         logger.info("=== New Tier-1 Candidate Event Detected ===")
         episode_start = time.monotonic()
+
+        # Clear the ledger automatically for a clean demo UI every run
+        db.clear_ledger()
+        logger.info("Ledger automatically cleared for a fresh run.")
+
+        if candidate_event.get("event_type") == "fall_detected":
+            self.live_logs.append({"type": "info", "msg": "Fall Detected: Auto-extracting ambient audio buffer..."})
+            try:
+                event_ts = candidate_event.get("timestamp", time.time())
+                audio_res = self.execute_tool("get_audio", {"t_start": event_ts - 5.0, "t_end": event_ts}, candidate_event)
+                clip = audio_res.get("clip_path")
+                if clip:
+                    iso_res = self.execute_tool("isolate_audio", {"clip_path": clip}, candidate_event)
+                    transcript = iso_res.get("transcript", "[No speech]")
+                    self.live_logs.append({"type": "info", "msg": f"Audio Transcript: {transcript}"})
+                    candidate_event["auto_transcript"] = transcript
+            except Exception as e:
+                logger.error(f"Auto-audio extraction failed: {e}")
+
+        if self._is_unambiguous_emergency(candidate_event):
+            logger.warning("Unambiguous emergency signature detected - fast-pathing to alert!")
+            self._finalize(
+                candidate_event, 
+                tool_call_trace=[], 
+                action="raise_alert",
+                args={
+                    "severity": "CRITICAL",
+                    "justification": "Person prone and motionless for 5+ seconds with no recovery. "
+                                     "Fast-pathed past full investigation due to unambiguous welfare signal.",
+                    "evidence_ids": [],
+                }, 
+                turn_timings=[], 
+                episode_start=episode_start
+            )
+            return
+
 
         messages = [
             {"role": "system", "content": SECURITY_MASTER_PROMPT},
@@ -500,6 +604,7 @@ class AgenticOrchestrator:
         tool_call_trace: List[Dict[str, Any]] = []
         turn_timings: List[Dict[str, Any]] = []
         parse_failures = 0
+        speak_count = 0
 
         while True:
             response, elapsed = self.send_to_llm(messages, think=False)
@@ -523,25 +628,11 @@ class AgenticOrchestrator:
                 continue
 
             if response.get("action") in ("raise_alert", "log_benign"):
-                logger.info("Draft (think=False) terminal decision received; re-asking with think=True "
-                            "for the deep-reasoned version that will be recorded.")
-                deep_response, deep_elapsed = self.send_to_llm(messages, think=True)
-                turn_timings.append({"kind": "final", "think": True, "elapsed_seconds": round(deep_elapsed, 2)})
-
-                if deep_response is None:
-                    logger.warning("think=True re-ask failed; falling back to the think=False draft decision.")
-                    deep_response = response
-
-                if deep_response.get("action") in ("raise_alert", "log_benign"):
-                    action = deep_response["action"]
-                    logger.info(f"Terminal action decided: {action.upper()}")
-                    self._finalize(candidate_event, tool_call_trace, action, deep_response.get("args", {}),
-                                    turn_timings, episode_start)
-                    return
-
-                # Deeper reasoning changed its mind and wants a tool instead of terminating —
-                # fold it into the normal tool-call handling below.
-                response = deep_response
+                action = response["action"]
+                logger.info(f"Terminal action decided: {action.upper()}")
+                self._finalize(candidate_event, tool_call_trace, action, response.get("args", {}),
+                                turn_timings, episode_start)
+                return
 
             messages.append({"role": "assistant", "content": json.dumps(response)})
 
@@ -561,6 +652,17 @@ class AgenticOrchestrator:
                     "evidence_ids": [],
                 }, turn_timings, episode_start)
                 return
+
+            if tool_name == "speak_to_camera":
+                speak_count += 1
+                if speak_count >= 3:
+                    logger.warning("3-Strike Safety Net triggered: Escaping to authority!")
+                    self._finalize(candidate_event, tool_call_trace, "raise_alert", {
+                        "severity": "CRITICAL",
+                        "justification": "3-Strike Safety Net triggered: Patient failed to respond to AI wellness checks.",
+                        "evidence_ids": [],
+                    }, turn_timings, episode_start)
+                    return
 
             tool_args = response.get("tool_args", {})
             result = self.execute_tool(tool_name, tool_args, candidate_event)

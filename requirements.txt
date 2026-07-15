@@ -8,4 +8,9 @@ ultralytics
 opencv-python
 torchaudio
 speechbrain
-
+faster-whisper
+av
+moviepy
+scipy
+numpy
+pyttsx3

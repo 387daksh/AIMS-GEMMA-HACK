@@ -8,3 +8,6 @@ pretrained_models/
 processed_audio/
 *.wav
 *.db
+*.mp4
+ngrok
+ngrok.exe

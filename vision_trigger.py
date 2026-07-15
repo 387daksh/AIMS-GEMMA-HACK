@@ -29,6 +29,7 @@ model = YOLO("yolov8n.pt")
 # --- SHARED STATE (written by the capture loop, read by the tool server thread) ---
 buffer_lock = threading.Lock()
 frame_buffer = deque(maxlen=FRAME_BUFFER_MAXLEN)  # entries: (ts, raw_bgr_frame, boxes, confidences, motion_score)
+trace_buffer = deque(maxlen=1000)  # lightweight historical trace: (ts, boxes, motion_score)
 audio_state = {"samples": None, "sample_rate": None, "session_start": None}
 
 
@@ -121,6 +122,24 @@ def recheck(after_seconds: float = 2.0):
     }
 
 
+@tool_app.get("/trace")
+def get_trace(seconds_back: float = 30.0):
+    now = time.time()
+    cutoff = now - seconds_back
+    trace_data = []
+    with buffer_lock:
+        last_ts = 0
+        for ts, boxes, motion in trace_buffer:
+            if ts >= cutoff and (ts - last_ts >= 0.5):
+                trace_data.append({
+                    "ts": round(ts, 2),
+                    "boxes": boxes,
+                    "motion_score": motion
+                })
+                last_ts = ts
+    return {"status": "ok", "camera_id": CAMERA_ID, "trace": trace_data}
+
+
 @tool_app.get("/zoom")
 def zoom(x1: float, y1: float, x2: float, y2: float, frame_ts: Optional[float] = None):
     """Crops from the RAW full-resolution buffered frame, not the YOLO inference copy."""
@@ -209,15 +228,22 @@ def main():
     # For a staged file, pace reads to roughly real-time so recheck's wall-clock
     # wait actually corresponds to new footage, same as it would from a live camera.
     source_fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    frame_interval = 1.0 / source_fps if is_file and source_fps > 0 else 0.0
+    frame_interval = (1.0 / source_fps) / 4.0 if is_file and source_fps > 0 else 0.0
 
     last_sent_by_camera = {}
     prev_gray_frame = None
     loop_count = 0
+    frame_counter = 0
+    
+    # Store the last YOLO output to reuse during skipped frames
+    last_persons = []
+    last_boxes = []
+    last_annotated = None
 
     print("SENTINEL Tier-1 Reflex Active. Monitoring feed... (Press 'q' in the video window to quit)")
 
     while cap.isOpened():
+        frame_counter += 1
         loop_start = time.time()
         ret, frame = cap.read()
         if not ret:
@@ -229,6 +255,7 @@ def main():
                 print(f"[*] Reached end of staged file, looping back to start (loop #{loop_count})...")
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 prev_gray_frame = None  # avoid a spurious motion spike across the last-frame -> first-frame jump
+                audio_state["session_start"] = time.time()  # reset audio sync
                 continue
             break
 
@@ -246,31 +273,48 @@ def main():
 
         prev_gray_frame = gray
 
-        # --- YOLO DETECTION on the raw full-res frame (boxes are already in original-frame coordinates) ---
-        results = model(frame, verbose=False)[0]
-        persons = []
-        boxes = []
-
-        for box in results.boxes:
-            class_id = int(box.cls[0])
-            if class_id == 0:  # COCO index 0 is 'person'
-                confidence = float(box.conf[0])
-                xyxy = box.xyxy[0].tolist()
-                persons.append(confidence)
-                boxes.append(xyxy)
+        # --- YOLO DETECTION (throttled to every 3rd frame to save CPU) ---
+        if frame_counter % 3 == 0 or not last_boxes:
+            results = model(frame, verbose=False)[0]
+            persons = []
+            boxes = []
+            for box in results.boxes:
+                class_id = int(box.cls[0])
+                if class_id == 0:  # COCO index 0 is 'person'
+                    confidence = float(box.conf[0])
+                    xyxy = box.xyxy[0].tolist()
+                    persons.append(confidence)
+                    boxes.append(xyxy)
+            last_persons = persons
+            last_boxes = boxes
+            if not args.headless:
+                last_annotated = results.plot()
+        else:
+            persons = last_persons
+            boxes = last_boxes
 
         with buffer_lock:
             frame_buffer.append((now, frame.copy(), boxes, persons, round(motion_score, 3)))
+            trace_buffer.append((now, boxes, round(motion_score, 3)))
 
         person_detected = len(persons) > 0
         top_confidence = max(persons) if persons else 0.0
         last_sent = last_sent_by_camera.get(CAMERA_ID, 0)
+        
+        # Check aspect ratio for falls (width > height * 1.2)
+        is_fallen = False
+        for box in boxes:
+            w = box[2] - box[0]
+            h = box[3] - box[1]
+            if h > 0 and (w / h) > 1.2:
+                is_fallen = True
+                break
 
         # Gate on BOTH a confident person detection AND real motion, not just presence —
         # a person sitting still in frame was re-firing every COOLDOWN seconds forever
         # since motion_score was computed but never actually checked before.
         if (person_detected and top_confidence > 0.60
-                and motion_score >= MOTION_THRESHOLD
+                and (motion_score >= MOTION_THRESHOLD or is_fallen)
                 and (now - last_sent) > COOLDOWN):
             print(f"Anomaly spotted! {len(persons)} person(s) detected (top confidence: {top_confidence:.2f}, motion: {motion_score:.2f})")
             payload = {
@@ -280,7 +324,8 @@ def main():
                 "vision_confidence": top_confidence,
                 "persons": persons,
                 "boxes": boxes,
-                "event_type": "person_spot",
+                "fallen": is_fallen,
+                "event_type": "fall_detected" if is_fallen else "person_spot",
                 "tool_server_url": f"http://127.0.0.1:{TOOL_SERVER_PORT}",
             }
             try:
@@ -292,8 +337,8 @@ def main():
             last_sent_by_camera[CAMERA_ID] = now
 
         if not args.headless:
-            annotated_frame = results.plot()
-            cv2.imshow("SENTINEL - Eyes", annotated_frame)
+            if last_annotated is not None:
+                cv2.imshow("SENTINEL - Eyes", last_annotated)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 

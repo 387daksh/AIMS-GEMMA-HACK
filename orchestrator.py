@@ -43,13 +43,15 @@ You have exactly these tools:
 - zoom(box=[x1,y1,x2,y2], frame_ts=optional): Crop a region from the RAW
   full-resolution frame to resolve visual ambiguity. Coordinates are in the
   same pixel space as the boxes on the candidate event / recheck results.
+- trace_motion(seconds_back): Get the bounding boxes and motion scores over the past N seconds (subsampled to 2 Hz). Use this FIRST to investigate a "fall_detected" event or to check for a silent fall during the window while you were thinking! A fall is mathematically visible if the bounding box aspect ratio flips (height becomes smaller than width), or if the Y-coordinate drops sharply.
 - get_audio(t_start, t_end): Pull a window from the rolling raw audio buffer.
   Returns acoustic features (peak/RMS amplitude, duration, clip_path) — NOT a
   transcript. Use this first before deciding whether isolation is needed.
 - isolate_audio(clip_path): Run SepFormer source separation on a clip_path you
-  already obtained from get_audio. Only call this if you judge the raw clip
-  too noisy/ambiguous to reason about — do not call it reflexively on every
-  audio window.
+  already obtained from get_audio. This tool will now automatically run Speech-to-Text
+  on the isolated audio and return a text transcript of what was spoken! Only call this 
+  if you judge the raw clip too noisy/ambiguous to reason about — do not call it reflexively 
+  on every audio window.
 - get_history(camera_id, minutes): Look up recent signed ledger records for
   this camera in the given time window (severity, timestamp, justification).
 
@@ -110,9 +112,24 @@ class AgenticOrchestrator:
         self.session = self._build_retry_session()
         db.init_db()
 
-        self.priv_key, self.pub_key = ledger.generate_key_pair()
-        self.pub_key_hex = self.pub_key.public_bytes_raw().hex()
-        logger.info(f"Agent Orchestrator initialized. Public Key: {self.pub_key_hex[:16]}...")
+        # Ensure persistent device identity across restarts
+        identity_file = "device_identity.json"
+        if os.path.exists(identity_file):
+            with open(identity_file, "r") as f:
+                key_data = json.load(f)
+                import cryptography.hazmat.primitives.asymmetric.ed25519 as ed25519
+                self.priv_key = ed25519.Ed25519PrivateKey.from_private_bytes(bytes.fromhex(key_data["priv_key_hex"]))
+                self.pub_key = self.priv_key.public_key()
+                self.pub_key_hex = key_data["pub_key_hex"]
+        else:
+            self.priv_key, self.pub_key = ledger.generate_key_pair()
+            self.pub_key_hex = self.pub_key.public_bytes_raw().hex()
+            with open(identity_file, "w") as f:
+                json.dump({
+                    "priv_key_hex": self.priv_key.private_bytes_raw().hex(),
+                    "pub_key_hex": self.pub_key_hex
+                }, f)
+        logger.info(f"Agent Orchestrator initialized. Persistent Public Key: {self.pub_key_hex[:16]}...")
 
         # Single-flight lock: only one investigation runs at a time. Without this,
         # a burst of candidate events each starts its own concurrent Ollama call —
@@ -272,7 +289,13 @@ class AgenticOrchestrator:
         try:
             response = self.session.post(
                 OLLAMA_URL,
-                json={"model": OLLAMA_MODEL, "messages": messages, "stream": False, "format": "json", "think": think},
+                json={
+                    "model": OLLAMA_MODEL, 
+                    "messages": messages, 
+                    "stream": False, 
+                    "format": "json",
+                    "keep_alive": "10m"
+                },
                 timeout=180 if think else 60,
             )
             response.raise_for_status()
@@ -309,6 +332,7 @@ class AgenticOrchestrator:
                     "boxes": data.get("boxes"),
                     "confidences": data.get("confidences"),
                     "motion_score": data.get("motion_score"),
+                    "frame_jpg_base64": data.get("frame_jpg_base64"),
                 }
 
             elif tool_name == "zoom":
@@ -323,7 +347,20 @@ class AgenticOrchestrator:
                 resp = self.session.get(f"{tool_server}/zoom", params=params, timeout=10)
                 resp.raise_for_status()
                 data = resp.json()
-                return {"frame_ts": data.get("frame_ts"), "box": data.get("box")}
+                return {
+                    "frame_ts": data.get("frame_ts"), 
+                    "box": data.get("box"),
+                    "crop_jpg_base64": data.get("crop_jpg_base64"),
+                }
+
+            elif tool_name == "trace_motion":
+                resp = self.session.get(
+                    f"{tool_server}/trace",
+                    params={"seconds_back": tool_args.get("seconds_back", 30.0)},
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                return resp.json()
 
             elif tool_name == "get_audio":
                 resp = self.session.get(
@@ -346,7 +383,10 @@ class AgenticOrchestrator:
                     )
                 resp.raise_for_status()
                 data = resp.json()
-                return {"cleaned_file": data.get("cleaned_file")}
+                return {
+                    "cleaned_file": data.get("cleaned_file"),
+                    "transcript": data.get("transcript", "[No speech detected or transcription failed]")
+                }
 
             elif tool_name == "get_history":
                 camera_id = tool_args.get("camera_id") or candidate_event.get("camera_id")
@@ -378,23 +418,39 @@ class AgenticOrchestrator:
             sig_hex = ledger.sign_data(self.priv_key, event_str).hex()
 
             db.insert_record(incident_record, prev_h, curr_h, sig_hex, self.pub_key_hex, t_now)
+            with open("anchor.log", "a") as f:
+                f.write(f"{t_now} | {self.pub_key_hex} | {curr_h}\n")
         logger.info(f"Sealed record in ledger. Hash: {curr_h[:12]}...")
 
     def _finalize(self, candidate_event: Dict[str, Any], tool_call_trace: List[Dict[str, Any]],
                   action: str, args: Dict[str, Any], turn_timings: List[Dict[str, Any]],
                   episode_start: float):
         total_elapsed = time.monotonic() - episode_start
-        severity = args.get("severity", "LOW" if action == "log_benign" else "HIGH")
+        severity = str(args.get("severity", "LOW" if action == "log_benign" else "HIGH")).upper()
         original_action = action
+
+        # Guardrail: Whitelist severity
+        if severity not in ("LOW", "MEDIUM", "HIGH", "CRITICAL"):
+            logger.warning(f"Guardrail: Invalid severity '{severity}'. Downgrading to MEDIUM.")
+            severity = "MEDIUM"
 
         # Guardrail: a LOW-severity "alert" is a contradiction — if the model's own
         # severity rating is LOW, nothing here actually warrants an alert. Downgrade
         # rather than trust the label, so a non-issue can't show up as RAISE_ALERT
         # on the demo dashboard just because the prompt wasn't followed perfectly.
-        if action == "raise_alert" and str(severity).upper() == "LOW":
+        if action == "raise_alert" and severity == "LOW":
             logger.warning("Guardrail: raise_alert with LOW severity is contradictory "
                             "(a LOW-severity 'alert' isn't actionable). Downgrading to log_benign.")
             action = "log_benign"
+
+        # Guardrail: cross-check evidence_ids
+        evidence_ids = args.get("evidence_ids", [])
+        if not isinstance(evidence_ids, list):
+            evidence_ids = []
+        valid_ids = {str(i) for i in range(len(tool_call_trace))} | {t["tool"] for t in tool_call_trace}
+        verified_evidence = [eid for eid in evidence_ids if str(eid) in valid_ids]
+        if len(verified_evidence) != len(evidence_ids):
+            logger.warning(f"Guardrail: Stripped hallucinated evidence_ids. Original: {evidence_ids}, Kept: {verified_evidence}")
 
         justification = args.get("justification") or args.get("reason")
         incident_record = {
@@ -404,7 +460,7 @@ class AgenticOrchestrator:
             "action": action,
             "severity": severity,
             "justification": justification or "",
-            "evidence_ids": args.get("evidence_ids", []),
+            "evidence_ids": verified_evidence,
             "details": args,
             "timing": {
                 "total_seconds": round(total_elapsed, 2),
@@ -508,10 +564,25 @@ class AgenticOrchestrator:
 
             tool_args = response.get("tool_args", {})
             result = self.execute_tool(tool_name, tool_args, candidate_event)
+            
+            # Extract images for the multimodal API and remove them from the text/ledger
+            images = []
+            if isinstance(result, dict):
+                if "frame_jpg_base64" in result:
+                    images.append(result.pop("frame_jpg_base64"))
+                    result["frame_jpg_base64"] = "[IMAGE_EXTRACTED_TO_VISION_MODEL]"
+                if "crop_jpg_base64" in result:
+                    images.append(result.pop("crop_jpg_base64"))
+                    result["crop_jpg_base64"] = "[IMAGE_EXTRACTED_TO_VISION_MODEL]"
+
             tool_call_trace.append({
                 "tool": tool_name,
                 "args": tool_args,
                 "result": result,
                 "at": datetime.utcnow().isoformat(),
             })
-            messages.append({"role": "user", "content": f"Tool '{tool_name}' result: {json.dumps(result)}"})
+            
+            msg = {"role": "user", "content": f"Tool '{tool_name}' result: {json.dumps(result)}"}
+            if images:
+                msg["images"] = images
+            messages.append(msg)

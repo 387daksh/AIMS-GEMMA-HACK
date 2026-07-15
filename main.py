@@ -20,11 +20,15 @@ async def process_audio(file: UploadFile = File(...)):
         buffer.write(await file.read())
 
     clean_track_path = engine.isolate_audio(temp_path)
+    
+    transcript = ""
+    if not clean_track_path.startswith("Error"):
+        transcript = engine.transcribe_audio(clean_track_path)
 
     if os.path.exists(temp_path):
         os.remove(temp_path)
 
-    return {"status": "success", "cleaned_file": clean_track_path}
+    return {"status": "success", "cleaned_file": clean_track_path, "transcript": transcript}
 
 
 if __name__ == "__main__":

@@ -2,6 +2,10 @@ import os
 import torch
 from scipy.io import wavfile
 from speechbrain.inference.separation import SepformerSeparation as separator
+try:
+    from faster_whisper import WhisperModel
+except ImportError:
+    WhisperModel = None
 
 # Windows Hackathon Fix: SpeechBrain tries to create symlinks which require Admin on Windows.
 # We monkeypatch pathlib to copy the files instead!
@@ -19,6 +23,27 @@ class AudioEngine:
             savedir="pretrained_models/sepformer-wham"
         )
         print("[+] SepFormer Engine fully loaded and standing by.")
+        
+        print("[*] Initializing Whisper STT Engine...")
+        if WhisperModel:
+            self.stt_model = WhisperModel("base.en", device="cpu", compute_type="int8")
+            print("[+] Whisper STT Engine fully loaded and standing by.")
+        else:
+            self.stt_model = None
+            print("[-] faster-whisper not installed. Transcription disabled.")
+
+    def transcribe_audio(self, file_path: str) -> str:
+        """Transcribes the given audio file into text."""
+        if not self.stt_model:
+            return "[Transcription failed: faster-whisper not installed]"
+            
+        try:
+            segments, info = self.stt_model.transcribe(file_path, beam_size=5)
+            transcript = " ".join([segment.text for segment in segments])
+            return transcript.strip()
+        except Exception as e:
+            print(f"[-] Transcription error: {e}")
+            return f"[Transcription error: {e}]"
 
     def isolate_audio(self, input_file_path: str) -> str:
         """

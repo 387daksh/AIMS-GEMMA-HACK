@@ -1,22 +1,31 @@
-# 🛡️ SENTINEL 2.0 (Formerly DrishTI) - Gemma Hackathon
+# SENTINEL (formerly DrishTI)
 
-SENTINEL is an agentic, on-device security orchestrator that bridges computer vision, audio processing, and Local LLM reasoning to detect, investigate, and escalate emergencies autonomously.
+**🥉 3rd place, Google Gemma Hackathon (July 2026)**
 
-Built entirely around **Gemma**, it features a **Three-Tier Architecture**:
-1. **Tier-1 Vision (Reflex)**: A low-latency YOLOv8 computer vision loop that detects candidate events (e.g., someone falling on camera). It also applies real-time HIPAA-compliant face pixelation and streams MJPEG video.
-2. **Tier-2 Audio & STT (Sensory)**: Faster-Whisper + SpeechBrain SepFormer for isolating voices from noisy environments and transcribing audio automatically on anomaly detection.
-3. **Tier-3 Orchestrator (Brain)**: The Gemma agent actively uses tools to decide if an alert is benign or critical, securing the decision in an immutable SQLite ledger. (Highly optimized: Gemma is restricted to exactly 1 tool call for blazing-fast hackathon response times, followed by immediate Twilio SMS dispatch).
+An on-device AI safety investigator. A camera spots a possible emergency (for example, someone falling), and a local Gemma agent investigates the scene, decides whether it is real, and escalates by SMS. Video and reasoning stay on the machine; only the alert leaves it.
 
----
+`Gemma 4 (Ollama)` `YOLOv8-pose` `Faster-Whisper` `SpeechBrain SepFormer` `FastAPI` `SQLite` `Twilio`
 
-## 🖥️ Mission Control Dashboard & Wow Factors
-Sentinel comes with a fully customized **Glassmorphism Mission Control Dashboard**.
-- **Live "Fake Dots" Skeletal Tracking**: The vision pipeline uses `yolov8n-pose.pt` to actively map the human body geometry during a fall. These skeletal maps are piped directly into the UI dashboard when Gemma uses the `zoom` or `recheck` tools!
-- **Hacker Typewriter UI**: Watch Gemma's thoughts and tool-calls physically type out on the screen in real time as she actively investigates the scene.
-- **Auto-Speak "Voice of God"**: The instant a fall is detected, the machine physically speaks out loud using `pyttsx3` ("Warning. Fall detected. Sentinel AI is analyzing the scene.") without blocking the LLM reasoning pipeline.
-- **Live CCTV Scanline Feeds**: View 3 zero-latency MJPEG feeds simultaneously (Raw, YOLO Pose, Privacy pixelation mask) overlaid with an authentic CRT scanline effect.
-- **Manual Override Button**: A dedicated UI button to instantly bypass the AI and trigger a Twilio SMS escalation.
-- **Hard Demo Lockout**: Prevents the UI from clearing during a presentation once a Critical Alert is reached.
+## How it works
+
+```
+Camera ──> Tier 1: Vision (reflex)      YOLOv8-pose flags a candidate event, pixelates faces
+               │
+               ▼
+Mic    ──> Tier 2: Audio (senses)       SepFormer isolates voices, Faster-Whisper transcribes
+               │
+               ▼
+           Tier 3: Gemma agent (brain)  calls tools (zoom, recheck) to investigate,
+                                        classifies benign vs critical
+               │
+               ▼
+           Hash-chained SQLite ledger + Twilio SMS escalation
+```
+
+- **Vision:** low-latency YOLOv8 loop with pose skeletons and real-time face pixelation for privacy; three live MJPEG feeds (raw, pose, privacy mask).
+- **Audio:** voice isolation in noisy rooms, transcription triggered only on anomalies.
+- **Agent:** Gemma decides with tool calls, capped for fast response; every decision is written to a hash-chained, signed SQLite ledger.
+- **Dashboard:** live feeds, the agent's reasoning streamed as it investigates, spoken alert on detection, and a manual override that escalates instantly.
 
 ---
 
